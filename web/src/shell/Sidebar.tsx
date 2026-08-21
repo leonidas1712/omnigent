@@ -43,6 +43,7 @@ import {
   SearchIcon,
   Settings2Icon,
   ShareIcon,
+  SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
   SquarePenIcon,
@@ -3993,6 +3994,11 @@ function ProjectFolderMenu({
   //   undefined = untouched (show the saved icon), string = a picked emoji,
   //   null = staged removal. Reset to `undefined` each time the modal opens.
   const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
+  // "Add icon" wants the modal to open with the picker already showing. Opening
+  // both in the same tick loses the race: the Dialog's focus trap counts as an
+  // interaction outside the just-mounted picker and closes it. Defer the picker
+  // to the Dialog's onOpenAutoFocus, which fires after that focus settles.
+  const openPickerOnMount = useRef(false);
   const deleteProject = useDeleteProject();
   const renameProject = useRenameProject();
   const updateConfig = useUpdateProjectConfig();
@@ -4000,12 +4006,16 @@ function ProjectFolderMenu({
   // merge the icon onto the other stored defaults (host / workspace / agent)
   // without a per-folder request on every sidebar render — and without wiping
   // those defaults on save.
-  const { data: iconConfig } = useProjectConfig(menuOpen || renameOpen ? projectId : null);
-  // The config PATCH replaces the whole blob, so a save must merge onto a
+  const {
+    data: iconConfig,
+    isError: iconConfigError,
+  } = useProjectConfig(menuOpen || renameOpen ? projectId : null);
+  // The config PATCH replaces the whole blob, so an ICON save must merge onto a
   // fully-loaded config or it silently wipes the other defaults. "Ready" means
   // the config actually resolved (`!== undefined` — `isLoading` alone is false
   // on a query *error* too, leaving no data to merge onto) — except a
   // label-only folder (`projectId === null`), whose base is legitimately `{}`.
+  // This gates only the icon path; renaming the name never needs the config.
   const configReady = projectId === null || iconConfig !== undefined;
   const savedIcon = iconConfig !== undefined ? iconConfig?.icon : icon;
   // What the modal's tile shows: the staged pick when touched, else the saved
@@ -4055,6 +4065,20 @@ function ProjectFolderMenu({
             <PencilIcon className="size-3.5" />
             Rename project
           </DropdownMenuItem>
+          {!icon ? (
+            <DropdownMenuItem
+              data-testid="add-project-icon"
+              onSelect={() => {
+                setRenameValue(projectName);
+                setPendingIcon(undefined);
+                openPickerOnMount.current = true;
+                setRenameOpen(true);
+              }}
+            >
+              <SmilePlusIcon className="size-3.5" />
+              Add icon
+            </DropdownMenuItem>
+          ) : null}
           <DropdownMenuItem data-testid="project-settings" onSelect={() => setSettingsOpen(true)}>
             <Settings2Icon className="size-3.5" />
             Project settings
@@ -4072,6 +4096,16 @@ function ProjectFolderMenu({
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent
           onClick={(e) => e.stopPropagation()}
+          // Opened from "Add icon": show the picker once the Dialog's focus
+          // trap has fully settled. Opening it during onOpenAutoFocus (or the
+          // same tick) still loses the race — the settling focus counts as an
+          // interaction outside the picker and dismisses it. A rAF defers past
+          // that, to the next frame, when the layer is stable.
+          onOpenAutoFocus={() => {
+            if (!openPickerOnMount.current) return;
+            openPickerOnMount.current = false;
+            requestAnimationFrame(() => setEmojiOpen(true));
+          }}
           // emoji-mart preventDefaults the pointer event, so Radix's own
           // outside-dismissal never fires for clicks elsewhere in the modal.
           // Catch them in the capture phase and close the picker ourselves,
@@ -4096,10 +4130,12 @@ function ProjectFolderMenu({
           <form
             onSubmit={async (e) => {
               e.preventDefault();
-              if (!configReady) return;
               const newName = renameValue.trim();
               const nameChanged = newName !== "" && newName !== projectName;
               const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
+              // Only the icon write needs a loaded config to merge onto; a
+              // name-only rename must proceed even if the config fetch failed.
+              if (iconChanged && !configReady) return;
               try {
                 // Name first: it promotes a label-only folder (creating the
                 // first-class row) and reconciles members. Capture the resolved
@@ -4177,11 +4213,24 @@ function ProjectFolderMenu({
                   // emoji-mart's scroll region inside shadow DOM. Stop the wheel
                   // from reaching the document-level lock so the grid scrolls.
                   onWheel={(e) => e.stopPropagation()}
+                  // When "Add icon" auto-opens this picker, the DropdownMenu
+                  // that launched it restores focus to its trigger ~200ms after
+                  // closing — a focus-outside that would dismiss the picker.
+                  // Ignore that one spurious refocus; real outside interactions
+                  // still close it.
+                  onFocusOutside={(e) => {
+                    if ((e.target as Element)?.closest?.('[data-testid="project-actions"]')) {
+                      e.preventDefault();
+                    }
+                  }}
                   // Nested in the rename Dialog, emoji-mart's own focus handling
                   // swallows Radix's default outside-pointer dismissal, so a
                   // click elsewhere in the modal wouldn't close the picker.
                   // Close it explicitly on any outside interaction.
-                  onInteractOutside={() => setEmojiOpen(false)}
+                  onInteractOutside={(e) => {
+                    if ((e.target as Element)?.closest?.('[data-testid="project-actions"]')) return;
+                    setEmojiOpen(false);
+                  }}
                 >
                   {displayIcon ? (
                     <div className="shrink-0 border-b p-1">
@@ -4215,6 +4264,12 @@ function ProjectFolderMenu({
                 onChange={(e) => setRenameValue(e.target.value)}
               />
             </div>
+            {iconConfigError && (
+              <p className="text-ui text-destructive" role="alert">
+                Couldn&apos;t load this project&apos;s icon settings. You can still rename it;
+                changing the icon is unavailable until this loads.
+              </p>
+            )}
             {(renameProject.isError || updateConfig.isError) && (
               <p className="text-ui text-destructive" role="alert">
                 {((renameProject.error ?? updateConfig.error) as Error).message}
@@ -4233,7 +4288,7 @@ function ProjectFolderMenu({
                 type="submit"
                 data-testid="rename-project-confirm"
                 loading={renameProject.isPending || updateConfig.isPending}
-                disabled={!configReady || renameValue.trim() === ""}
+                disabled={renameValue.trim() === ""}
               >
                 Confirm
               </Button>
